@@ -1,0 +1,61 @@
+name: CI SM120 NVFP4 Triton Kernel
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify-kernel-and-patch:
+    name: LF/BOM, AST & Byte-Exact Patch Verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify UTF-8 without BOM and LF Line Endings
+        run: |
+          python - <<'EOF'
+          import subprocess, sys
+          files = subprocess.check_output(["git", "ls-files"]).decode().splitlines()
+          errors = []
+          for f in files:
+              data = open(f, "rb").read()
+              if data.startswith(b"\xef\xbb\xbf"):
+                  errors.append(f"{f}: contains UTF-8 BOM")
+              if b"\r\n" in data:
+                  errors.append(f"{f}: contains CRLF line endings")
+          if errors:
+              print("\n".join(errors), file=sys.stderr)
+              sys.exit(1)
+          print(f"Verified {len(files)} tracked files: pure UTF-8 (no BOM) + LF.")
+          EOF
+
+      - name: Compile Python AST (Orig, Patched & Test Harness)
+        run: |
+          python -m py_compile \
+            orig/sparse_attn.py orig/sparse_attention.py orig/gather_nvfp4_index_k.py \
+            patched/sparse_attn.py patched/sparse_attention.py \
+            test_sm120_nvfp4_triton.py
+
+      - name: Verify PATCH.diff Reconstructs patched/ Byte-for-Byte from orig/
+        run: |
+          mkdir -p /tmp/work/orig
+          cp orig/sparse_attention.py /tmp/work/orig/sparse_attention.py
+          cp orig/sparse_attn.py /tmp/work/orig/sparse_attn.py
+          patch -d /tmp/work -p1 --binary < patched/PATCH.diff
+          cmp -s /tmp/work/orig/sparse_attention.py patched/sparse_attention.py
+          cmp -s /tmp/work/orig/sparse_attn.py patched/sparse_attn.py
+          echo "Byte-for-byte match verified between orig + PATCH.diff and patched/."
+
+      - name: Verify Blackwell SM120 SIMD PTX Instructions
+        run: |
+          grep -q "cvt.rn.f16x2.e2m1x2" patched/sparse_attn.py
+          grep -q "cvt.rn.f16x2.e4m3x2" patched/sparse_attn.py
+          grep -q "mul.rn.f16x2" patched/sparse_attn.py
+          echo "Blackwell SM120 SIMD PTX instructions verified."

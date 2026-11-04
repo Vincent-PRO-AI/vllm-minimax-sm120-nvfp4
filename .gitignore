@@ -1,0 +1,20 @@
+# Environments & Secrets
+.env
+.env.*
+*.env
+*.pem
+*.key
+*secret*
+*credentials*
+
+# Python / PyTorch / Triton
+__pycache__/
+*.py[cod]
+*.so
+.triton/
+*.pt
+*.pth
+*.safetensors
+
+# Local agent instructions (not published)
+HERMES_PROMPT.md

@@ -1,0 +1,80 @@
+# MiniMax-M3.1-Flash — Verified Recipe Profiles for 4× and 8× NVIDIA RTX PRO 6000 Blackwell (SM120)
+model: MiniMaxAI/MiniMax-M3.1-Flash
+image: docker.io/vllm/vllm-openai@sha256:86f582dae25ea92802353727164ae4eb03b37b18baf9119b805ffaec2a7ef07c
+
+hardware_profiles:
+  rtx_pro_6000_4x:
+    verified: true
+    gpu: "4x NVIDIA RTX PRO 6000 Blackwell Server Edition (96 GB, sm_120)"
+    tensor_parallel_size: 4
+    enable_expert_parallel: true
+    enable_ep_weight_filter: true
+    kv_cache_dtype: nvfp4
+    attention_config:
+      indexer_kv_dtype: fp8
+    speculative_config:
+      method: dspark
+      num_speculative_tokens: 7
+      attention_backend: TRITON_ATTN
+      kv_cache_dtype: fp8
+      draft_sample_method: probabilistic
+      rejection_sample_method: block
+    block_size: 128
+    max_model_len: 524288
+    max_num_seqs: 256
+    max_num_batched_tokens: 32768
+    gpu_memory_utilization: 0.95
+    notes: >
+      Recommended 4-GPU SM120 profile (TP=4, EP=4). Requires Triton SM120 NVFP4 KV
+      reader patch (patched/sparse_attention.py, patched/sparse_attn.py). Increases
+      KV pool from 803,712 to 1,110,400 tokens (+38.2%, 2.12x concurrency at 512k)
+      and reduces long-context prefill TTFT by 21-26% (128k TTFT: 25.60s vs 32.62s in FP8).
+
+  rtx_pro_6000_8x_tep_dep_nvfp4:
+    verified: true
+    gpu: "8x NVIDIA RTX PRO 6000 Blackwell Server Edition (96 GB, sm_120)"
+    tensor_parallel_size: 4
+    data_parallel_size: 2
+    enable_expert_parallel: true
+    enable_ep_weight_filter: true
+    kv_cache_dtype: nvfp4
+    attention_config:
+      indexer_kv_dtype: fp8
+    speculative_config:
+      method: dspark
+      num_speculative_tokens: 7
+      attention_backend: TRITON_ATTN
+      kv_cache_dtype: fp8
+      draft_sample_method: probabilistic
+      rejection_sample_method: block
+    block_size: 128
+    max_model_len: 524288
+    max_num_seqs: 256
+    max_num_batched_tokens: 32768
+    gpu_memory_utilization: 0.95
+    notes: >
+      8-GPU SM120 NVFP4 profile using TP=4 + DP=2 + EP=8 (--enable-expert-parallel
+      shards experts across all 8 GPUs while keeping 16 Q heads per KV head per TP rank).
+      Validated at 324.8 tok/s (C16).
+
+  rtx_pro_6000_8x_tp8_fp8:
+    verified: true
+    gpu: "8x NVIDIA RTX PRO 6000 Blackwell Server Edition (96 GB, sm_120)"
+    tensor_parallel_size: 8
+    enable_expert_parallel: true
+    enable_ep_weight_filter: true
+    kv_cache_dtype: fp8
+    speculative_config:
+      method: dspark
+      num_speculative_tokens: 7
+      attention_backend: TRITON_ATTN
+      kv_cache_dtype: fp8
+      draft_sample_method: probabilistic
+      rejection_sample_method: block
+    block_size: 128
+    max_model_len: 1048576
+    max_num_seqs: 256
+    max_num_batched_tokens: 32768
+    gpu_memory_utilization: 0.95
+    notes: >
+      8-GPU SM120 full 1M context profile (TP=8, EP=8, ~1.9M KV token pool in FP8).
