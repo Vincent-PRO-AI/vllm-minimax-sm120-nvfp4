@@ -37,8 +37,9 @@ hardware_profiles:
       reader patch (patched/sparse_attention.py, patched/sparse_attn.py). Against FP8 on
       the same pod: KV pool 803,712 -> 1,110,528 tokens (+38.2%, 2.12x concurrency at 512k),
       C16 344.0 -> 367.3 tok/s (+6.8%), TTFT 8k 5.96 -> 3.93 s (-34.1%),
-      TTFT 128k 24.79 -> 22.06 s (-11.0%). Disable LMCache: its store path cannot copy
-      the 72-byte NVFP4 pages (see README section 3).
+      TTFT 128k 24.79 -> 22.06 s (-11.0%). LMCache works after the patches in
+      patches/lmcache/lmcache_0_5_6_nvfp4.py plus "kv_load_failure_policy":"recompute"
+      in --kv-transfer-config (see README section 3).
 
   rtx_pro_6000_8x_tp8_nvfp4:
     verified: true

@@ -76,25 +76,36 @@ Cosine similarity against an exact PyTorch NVFP4 dequantization:
 
 ---
 
-## 3. Production caveat: LMCache cannot store NVFP4 pages
+## 3. LMCache with NVFP4 pages: two real bugs, and the fixes
 
-With the `LMCacheMPConnector` (`--kv-transfer-config`), the D2H store path cannot copy the 72-byte NVFP4 pages:
+The `LMCacheMPConnector` (`--kv-transfer-config`) works with NVFP4 pages only after two patches to **LMCache 0.5.6** (`patches/lmcache/lmcache_0_5_6_nvfp4.py`, applied before the LMCache MP server starts):
+
+**Bug 1 — store (D2H): a single `cudaMemcpy` crosses a pinned-chunk boundary.**
+LMCache's Python fallback receives `host_buffer_offset` and `host_buffer_alignments` (`PIN_CHUNK_SIZE = 64 MB`) but ignores them and issues one copy. A 256k-token prompt is a 37 MB KV object in NVFP4, so it frequently straddles two `cudaHostRegister` regions:
 
 ```
-lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py:781 store_with_chunk_mask
+lmcache_driven_transfer.py:781 store_with_chunk_mask
   → object_group_transfer.py:770 lmcache_memcpy_async_d2h
   → torch_ops/mem_kernels.py:616  RuntimeError: cudaMemcpy failed with error code 1
 ```
 
-Measured threshold (`--chunk-size 1024`): `0` errors at 512-token prompts (no store attempted), `15` errors at 2048-token prompts. Under concurrency the failure escalates and kills the engine:
+Not NVFP4-specific — FP8 objects (67 MB at 256k) can hit it too; it is only more likely here. The patch splits the copy at chunk boundaries, exactly like the C++ implementation.
+
+**Bug 2 — retrieve (H2D): the scatter writes an FP8 staging into a uint8 page.**
 
 ```
-(EngineCore) ERROR core.py:1545
-  scheduler.py:3354 _update_from_kv_xfer_finished
-    assert req_id in self.requests   →  AssertionError  →  EngineDeadError
+scheduler.py:3547  Failing 1 request(s) due to KV load failure (failure_policy=fail, 8192 tokens affected)
+RuntimeError: index_copy_(): self and source expected to have the same dtype,
+              but got (self) Byte and (source) Float8_e4m3fn
+→ scheduler.py:3354  assert req_id in self.requests  →  EngineCore fatal
 ```
 
-Consequences: no prefix caching, and possible engine death. Options: disable LMCache for NVFP4 profiles, fix the alignment in LMCache, or harden the KV connector in vLLM (an assertion on a late completion event is a robustness defect independent of NVFP4).
+A 72-byte NVFP4 token is opaque bytes: the patch reinterprets (`view`) instead of converting, and covers all 14 scatter sites in `mp_mem_kernels.py`.
+
+**Safety net (vLLM side).** Even with both patches, a failed KV load must not kill the engine. Set `"kv_load_failure_policy": "recompute"` in `--kv-transfer-config`: the request recomputes its prefill instead of failing, and the `assert req_id in self.requests` path is never reached. The assertion itself is a robustness defect worth reporting upstream, independent of NVFP4.
+
+**Measured after the patches** (TP4 and TP8, NVFP4, LMCache MP + L2 on NFS): a 16 × 8k burst at C8 after 128k and 256k prefills — the exact sequence that previously produced 88 store failures and one engine death — completes **16/16 with zero errors and zero restarts**.
+
 
 ---
 
