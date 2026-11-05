@@ -1,114 +1,9 @@
---- a/orig/sparse_attention.py
-+++ b/orig/sparse_attention.py
-@@ -136,13 +136,32 @@
-     """Block-sparse GQA backend for MiniMax M3 sparse attention layers."""
- 
-     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
--    # bf16 or fp8 (e4m3/e5m2): the Triton kernels dequant fp8 before the dots.
-+    # bf16, fp8 (e4m3/e5m2) or nvfp4 (packed E2M1 + block scales): the Triton
-+    # kernels dequant fp8/nvfp4 before the dots.
-     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-         "bfloat16",
-         "fp8",
-         "fp8_e4m3",
-         "fp8_e5m2",
-+        "nvfp4",
-     ]
-+
-+    @classmethod
-+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
-+        """Store each head's K and V as two slots of packed data + block scales."""
-+        if spec.state_content_bytes is not None or not spec.kv_quant_mode.is_nvfp4:
-+            return spec
-+        from dataclasses import replace
-+
-+        from vllm.utils.torch_utils import get_dtype_size, nvfp4_kv_cache_full_dim
-+
-+        return replace(
-+            spec,
-+            num_head_slots=2 * spec.num_kv_heads,
-+            state_content_bytes=nvfp4_kv_cache_full_dim(spec.head_size)
-+            * get_dtype_size(spec.dtype),
-+            kv_head_major_slots=True,
-+        )
- 
-     @staticmethod
-     def get_name() -> str:
-@@ -178,9 +197,11 @@
-         # is listed first because these layers publish two head slots while the
-         # indexer publishes one, and mixed HNC shapes need a block-compact
-         # layout to share the block-id pool.
-+        # NVFP4 stores each head's K and V as two head-major slots inside a
-+        # block, so on non-ROCm the block-compact LBHNC layout is required.
-         if _minimax_m3_aiter_sparse_pa_requested():
-             return (KVCacheLayout.LBHNC, KVCacheLayout.LHBNC)
--        return super().supported_kv_cache_layouts()
-+        return (KVCacheLayout.LBHNC,)
- 
- 
- @dataclass
-@@ -410,7 +431,8 @@
-         self.scale = scale
-         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
-         self.kv_cache_dtype = kv_cache_dtype
--        self.use_fp8_kv = is_quantized_kv_cache(kv_cache_dtype)
-+        self.use_nvfp4_kv = get_kv_quant_mode(kv_cache_dtype).is_nvfp4
-+        self.use_fp8_kv = is_quantized_kv_cache(kv_cache_dtype) and not self.use_nvfp4_kv
-         if "e5m2" in kv_cache_dtype:
-             self.kv_cache_fp8_dtype = (
-                 torch.float8_e5m2fnuz
-@@ -479,8 +501,16 @@
-         kv_cache = (
-             kv_cache.view(self.kv_cache_fp8_dtype) if self.use_fp8_kv else kv_cache
-         )
--        k_scale = getattr(layer, "_k_scale", None) if self.use_fp8_kv else None
--        v_scale = getattr(layer, "_v_scale", None) if self.use_fp8_kv else None
-+        k_scale = (
-+            getattr(layer, "_k_scale", None)
-+            if (self.use_fp8_kv or self.use_nvfp4_kv)
-+            else None
-+        )
-+        v_scale = (
-+            getattr(layer, "_v_scale", None)
-+            if (self.use_fp8_kv or self.use_nvfp4_kv)
-+            else None
-+        )
- 
-         # Decode [:nd]: split-K over the selected blocks (request-major chunks).
-         if main_md.num_decodes > 0:
-@@ -534,8 +564,10 @@
-     Blackwell (SM100) uses the MSA attend for supported top-k block counts
-     when the KV cache is BF16, FP8 E4M3 or NVFP4; MI355 uses AITER sparse PA
-     with shuffle KV cache layout; Other platforms and FP8 E5M2 fall
--    back to Triton. NVFP4 is MSA-only. The MSA modules are imported lazily to
--    avoid import errors on unsupported platforms.
-+    back to Triton. On SM120 (no tcgen05/TMEM) NVFP4 also falls back to
-+    Triton: the Triton kernels dequantize the packed E2M1 slots on load. The
-+    MSA modules are imported lazily to avoid import errors on unsupported
-+    platforms.
-     """
-     use_aiter_sparse_pa = minimax_m3_use_aiter_sparse_pa(
-         num_kv_heads, emits_sparse_block_table=emits_sparse_block_table
-@@ -563,12 +595,6 @@
-             topk_blocks,
-         )
-         return MiniMaxM3SparseRocmNvfp4Backend, MiniMaxM3SparseRocmNvfp4Impl
--    if use_nvfp4 and (use_aiter_sparse_pa or not use_msa):
--        raise ValueError(
--            "MiniMax M3 sparse attention supports an NVFP4 KV cache only with "
--            f"the SM100 MSA backend (kv_cache_dtype={kv_cache_dtype}, "
--            f"topk_blocks={topk_blocks})"
--        )
-     selected = (
-         "AITER_SPARSE_PA" if use_aiter_sparse_pa else ("MSA" if use_msa else "Triton")
-     )
---- a/orig/sparse_attn.py
-+++ b/orig/sparse_attn.py
-@@ -31,6 +31,86 @@
-     torch.float8_e5m2,
+--- a/vllm/models/minimax_m3/common/ops/sparse_attn.py
++++ b/vllm/models/minimax_m3/common/ops/sparse_attn.py
+@@ -32,6 +32,86 @@
      torch.float8_e5m2fnuz,
  )
-+
+ 
 +# Packed NVFP4 (E2M1) KV page: 128 tokens x 72 bytes = 64 packed E2M1 bytes
 +# (2 elements per byte, low nibble first) + 8 E4M3 16-element block scales.
 +_NVFP4_SCALE_BASE = tl.constexpr(SPARSE_BLOCK_SIZE * (128 // 2))  # 8192
@@ -188,9 +83,10 @@
 +    scale_u8 = tl.load(slot_ptr + _NVFP4_SCALE_BASE + scale_off, mask=pos_mask[:, None], other=0)
 +    lo, hi = _e2m1x2_scale_to_f32x2_ptx(packed, scale_u8)
 +    return tl.interleave(lo, hi)
- 
++
  
  # ---------------------------------------------------------------------------
+ # GQA block-sparse attention (paged). Main heads attend only to the selected
 @@ -91,6 +171,7 @@
      BLOCK_SIZE_H: tl.constexpr,
      BLOCK_SIZE_QH: tl.constexpr,
@@ -463,3 +359,108 @@
          KV_SCALE_MODE=kv_scale_mode,
          USE_PDL=use_pdl,
          **pdl_launch,
+--- a/vllm/models/minimax_m3/common/sparse_attention.py
++++ b/vllm/models/minimax_m3/common/sparse_attention.py
+@@ -136,14 +136,33 @@
+     """Block-sparse GQA backend for MiniMax M3 sparse attention layers."""
+ 
+     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
+-    # bf16 or fp8 (e4m3/e5m2): the Triton kernels dequant fp8 before the dots.
++    # bf16, fp8 (e4m3/e5m2) or nvfp4 (packed E2M1 + block scales): the Triton
++    # kernels dequant fp8/nvfp4 before the dots.
+     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+         "bfloat16",
+         "fp8",
+         "fp8_e4m3",
+         "fp8_e5m2",
++        "nvfp4",
+     ]
+ 
++    @classmethod
++    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
++        """Store each head's K and V as two slots of packed data + block scales."""
++        if spec.state_content_bytes is not None or not spec.kv_quant_mode.is_nvfp4:
++            return spec
++        from dataclasses import replace
++
++        from vllm.utils.torch_utils import get_dtype_size, nvfp4_kv_cache_full_dim
++
++        return replace(
++            spec,
++            num_head_slots=2 * spec.num_kv_heads,
++            state_content_bytes=nvfp4_kv_cache_full_dim(spec.head_size)
++            * get_dtype_size(spec.dtype),
++            kv_head_major_slots=True,
++        )
++
+     @staticmethod
+     def get_name() -> str:
+         return "MINIMAX_M3_SPARSE"
+@@ -178,9 +197,11 @@
+         # is listed first because these layers publish two head slots while the
+         # indexer publishes one, and mixed HNC shapes need a block-compact
+         # layout to share the block-id pool.
++        # NVFP4 stores each head's K and V as two head-major slots inside a
++        # block, so on non-ROCm the block-compact LBHNC layout is required.
+         if _minimax_m3_aiter_sparse_pa_requested():
+             return (KVCacheLayout.LBHNC, KVCacheLayout.LHBNC)
+-        return super().supported_kv_cache_layouts()
++        return (KVCacheLayout.LBHNC,)
+ 
+ 
+ @dataclass
+@@ -410,7 +431,8 @@
+         self.scale = scale
+         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+         self.kv_cache_dtype = kv_cache_dtype
+-        self.use_fp8_kv = is_quantized_kv_cache(kv_cache_dtype)
++        self.use_nvfp4_kv = get_kv_quant_mode(kv_cache_dtype).is_nvfp4
++        self.use_fp8_kv = is_quantized_kv_cache(kv_cache_dtype) and not self.use_nvfp4_kv
+         if "e5m2" in kv_cache_dtype:
+             self.kv_cache_fp8_dtype = (
+                 torch.float8_e5m2fnuz
+@@ -479,8 +501,16 @@
+         kv_cache = (
+             kv_cache.view(self.kv_cache_fp8_dtype) if self.use_fp8_kv else kv_cache
+         )
+-        k_scale = getattr(layer, "_k_scale", None) if self.use_fp8_kv else None
+-        v_scale = getattr(layer, "_v_scale", None) if self.use_fp8_kv else None
++        k_scale = (
++            getattr(layer, "_k_scale", None)
++            if (self.use_fp8_kv or self.use_nvfp4_kv)
++            else None
++        )
++        v_scale = (
++            getattr(layer, "_v_scale", None)
++            if (self.use_fp8_kv or self.use_nvfp4_kv)
++            else None
++        )
+ 
+         # Decode [:nd]: split-K over the selected blocks (request-major chunks).
+         if main_md.num_decodes > 0:
+@@ -534,8 +564,10 @@
+     Blackwell (SM100) uses the MSA attend for supported top-k block counts
+     when the KV cache is BF16, FP8 E4M3 or NVFP4; MI355 uses AITER sparse PA
+     with shuffle KV cache layout; Other platforms and FP8 E5M2 fall
+-    back to Triton. NVFP4 is MSA-only. The MSA modules are imported lazily to
+-    avoid import errors on unsupported platforms.
++    back to Triton. On SM120 (no tcgen05/TMEM) NVFP4 also falls back to
++    Triton: the Triton kernels dequantize the packed E2M1 slots on load. The
++    MSA modules are imported lazily to avoid import errors on unsupported
++    platforms.
+     """
+     use_aiter_sparse_pa = minimax_m3_use_aiter_sparse_pa(
+         num_kv_heads, emits_sparse_block_table=emits_sparse_block_table
+@@ -563,12 +595,6 @@
+             topk_blocks,
+         )
+         return MiniMaxM3SparseRocmNvfp4Backend, MiniMaxM3SparseRocmNvfp4Impl
+-    if use_nvfp4 and (use_aiter_sparse_pa or not use_msa):
+-        raise ValueError(
+-            "MiniMax M3 sparse attention supports an NVFP4 KV cache only with "
+-            f"the SM100 MSA backend (kv_cache_dtype={kv_cache_dtype}, "
+-            f"topk_blocks={topk_blocks})"
+-        )
+     selected = (
+         "AITER_SPARSE_PA" if use_aiter_sparse_pa else ("MSA" if use_msa else "Triton")
+     )

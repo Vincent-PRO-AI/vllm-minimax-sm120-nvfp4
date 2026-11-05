@@ -1,61 +1,101 @@
-name: CI SM120 NVFP4 Triton Kernel
+name: ci-kernel
 
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+
+env:
+  VLLM_COMMIT: 8744dd2fb
 
 jobs:
-  verify-kernel-and-patch:
-    name: LF/BOM, AST & Byte-Exact Patch Verification
+  hygiene:
+    name: LF / BOM / syntax / sha256
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Verify UTF-8 without BOM and LF Line Endings
+      - name: Files are LF-only and BOM-free
         run: |
-          python - <<'EOF'
-          import subprocess, sys
-          files = subprocess.check_output(["git", "ls-files"]).decode().splitlines()
-          errors = []
-          for f in files:
-              data = open(f, "rb").read()
-              if data.startswith(b"\xef\xbb\xbf"):
-                  errors.append(f"{f}: contains UTF-8 BOM")
-              if b"\r\n" in data:
-                  errors.append(f"{f}: contains CRLF line endings")
-          if errors:
-              print("\n".join(errors), file=sys.stderr)
-              sys.exit(1)
-          print(f"Verified {len(files)} tracked files: pure UTF-8 (no BOM) + LF.")
+          python3 - <<'PY'
+          import pathlib, sys
+          bad = []
+          for name in ["patched/sparse_attn.py", "patched/sparse_attention.py",
+                       "patched/PATCH.diff", "test_sm120_nvfp4_triton.py", "README.md"]:
+              b = pathlib.Path(name).read_bytes()
+              if b"\r" in b: bad.append(f"{name}: CRLF/CR found")
+              if b.startswith(b"\xef\xbb\xbf"): bad.append(f"{name}: UTF-8 BOM")
+          print("\n".join(bad) if bad else "all files LF, no BOM")
+          sys.exit(1 if bad else 0)
+          PY
+      - name: Python syntax (3.12)
+        run: python3 -m py_compile patched/sparse_attn.py patched/sparse_attention.py test_sm120_nvfp4_triton.py
+      - name: sha256 matches README
+        run: |
+          sha256sum -c <<'EOF'
+          30aea01a924750de9876d4260773734b2fce5a33816e517f9a8dd353aec44d4f  patched/sparse_attn.py
+          62a5abb02777aa46fbe2acc5a2276c95babcc6fe831663b820496f335715edc2  patched/sparse_attention.py
+          6fe5cbe3eaee009473b87ca3621b47906ace7fc5796d187b4bb2bb605928940b  patched/PATCH.diff
+          9a99c48e4d7ae6ba4ddddcdb0dfeef6038f50ed360cf25c3845e8fd4af857a5c  test_sm120_nvfp4_triton.py
           EOF
 
-      - name: Compile Python AST (Orig, Patched & Test Harness)
+  patch-applies:
+    name: PATCH.diff applies to vLLM 8744dd2fb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the pinned vLLM revision (blobless)
         run: |
-          python -m py_compile \
-            orig/sparse_attn.py orig/sparse_attention.py orig/gather_nvfp4_index_k.py \
-            patched/sparse_attn.py patched/sparse_attention.py \
-            test_sm120_nvfp4_triton.py
+          mkdir vllm && cd vllm
+          git init -q .
+          git remote add origin https://github.com/vllm-project/vllm.git
+          git fetch -q --depth 1 origin "$VLLM_COMMIT"
+          git checkout -q FETCH_HEAD
+      - name: Apply and compare byte-for-byte
+        run: |
+          cd vllm
+          git apply --check ../patched/PATCH.diff
+          git apply ../patched/PATCH.diff
+          cmp vllm/models/minimax_m3/common/ops/sparse_attn.py ../patched/sparse_attn.py
+          cmp vllm/models/minimax_m3/common/sparse_attention.py ../patched/sparse_attention.py
+          echo "patch reproduces patched/ exactly"
 
-      - name: Verify PATCH.diff Reconstructs patched/ Byte-for-Byte from orig/
+  kernel-invariants:
+    name: SM120 NVFP4 invariants (no GPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Layout, dequant path and SM120 constraints
         run: |
-          mkdir -p /tmp/work/orig
-          cp orig/sparse_attention.py /tmp/work/orig/sparse_attention.py
-          cp orig/sparse_attn.py /tmp/work/orig/sparse_attn.py
-          patch -d /tmp/work -p1 --binary < patched/PATCH.diff
-          cmp -s /tmp/work/orig/sparse_attention.py patched/sparse_attention.py
-          cmp -s /tmp/work/orig/sparse_attn.py patched/sparse_attn.py
-          echo "Byte-for-byte match verified between orig + PATCH.diff and patched/."
+          python3 - <<'PY'
+          import pathlib, re, sys
+          attn = pathlib.Path("patched/sparse_attn.py").read_text()
+          back = pathlib.Path("patched/sparse_attention.py").read_text()
+          errs = []
 
-      - name: Verify Blackwell SM120 SIMD PTX Instructions
-        run: |
-          grep -q "cvt.rn.f16x2.e2m1x2" patched/sparse_attn.py
-          grep -q "cvt.rn.f16x2.e4m3x2" patched/sparse_attn.py
-          grep -q "mul.rn.f16x2" patched/sparse_attn.py
-          echo "Blackwell SM120 SIMD PTX instructions verified."
+          for ins in ("cvt.rn.f16x2.e2m1x2", "cvt.rn.f16x2.e4m3x2", "mul.rn.f16x2"):
+              if ins not in attn: errs.append(f"missing PTX instruction {ins}")
+
+          if "_NVFP4_SCALE_BASE" not in attn: errs.append("missing _NVFP4_SCALE_BASE")
+          if not re.search(r"_NVFP4_SCALE_BASE\s*=\s*tl\.constexpr\([^)]*128\s*//\s*2", attn):
+              errs.append("scale base is not 128//2 * BLOCK bytes")
+          if "BLOCK_SIZE_D // 2" not in attn: errs.append("token stride is not BLOCK_SIZE_D // 2 (72-byte-stride bug)")
+          if not re.search(r"\(t\s*%\s*4\)", attn): errs.append("V swizzle (t % 4) missing")
+
+          # comments may legitimately mention "no tcgen05 here" -> strip them first
+          def code_of(src):
+              return "\n".join(line.split("#")[0] for line in src.splitlines())
+
+          code = code_of(attn) + code_of(back)
+          for bad in ("alloc_tmem(", "tcgen05.", "import fmha_sm100", "fmha_sm100.", "q8kv4_"):
+              if bad in code: errs.append(f"forbidden SM100 symbol in code: {bad}")
+
+          for token in ('"nvfp4"', "LBHNC"):
+              if token not in back: errs.append(f"missing backend token {token}")
+
+          print("\n".join(errs) if errs else "all SM120 NVFP4 invariants hold")
+          sys.exit(1 if errs else 0)
+          PY
+
+  # NOT covered by CI: the numerical cosine similarity, which needs an SM120 GPU.
+  # Reproduce on hardware with:  python3 test_sm120_nvfp4_triton.py
+  #   expected: ALL SM120 NVFP4 TRITON TESTS PASSED!
